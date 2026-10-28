@@ -1,12 +1,9 @@
-from _pytest._io.saferepr import safe_repr
-
-
-class Unrepresentable:
-    def __getattribute__(self, name):
-        raise RuntimeError("attribute access failed")
+class SomeClass:
+    def __getattribute__(self, attr):
+        raise
 
     def __repr__(self):
-        raise ValueError("representation failed")
+        raise
 
-
-safe_repr(Unrepresentable())
+def test():
+    SomeClass().attr
