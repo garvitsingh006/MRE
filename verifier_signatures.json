@@ -1,0 +1,18 @@
+{
+  "pytest-dev__pytest-7168": {
+    "buggy_exception_types": ["RuntimeError"],
+    "origin": "Issue: overridden object attributes cause pytest saferepr fallback to raise"
+  },
+  "sympy__sympy-12454": {
+    "buggy_exception_types": ["IndexError"],
+    "origin": "Issue: upper-triangular check on tall matrix accesses nonexistent column"
+  },
+  "django__django-13028": {
+    "buggy_exception_types": ["NotSupportedError"],
+    "origin": "Issue: valid related object rejected as an unsupported expression"
+  },
+  "psf__requests-2148": {
+    "buggy_exception_types": ["ConnectionResetError"],
+    "origin": "Issue #2144 reports raw socket.error; Python 3 exposes ECONNRESET as ConnectionResetError (OSError subclass). The desired post-fix exception is requests.exceptions.ConnectionError, not the pre-fix exception."
+  }
+}

@@ -102,7 +102,8 @@ class IsolatedRunnerTests(unittest.TestCase):
         self.assertIn("--cpus=2", create_command)
         self.assertIn("--pids-limit=256", create_command)
         self.assertIn("--rm", create_command)
-        self.assertEqual(mock_run.call_args_list[2].kwargs["input"], "diff --git a/a b/a\n")
+        self.assertEqual(mock_run.call_args_list[2].kwargs["input"], b"diff --git a/a b/a\n")
+        self.assertIs(mock_run.call_args_list[2].kwargs["text"], False)
 
     @patch("src.run_script.subprocess.run")
     def test_runner_reports_script_timeout(self, mock_run):
