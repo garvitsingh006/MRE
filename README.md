@@ -20,7 +20,7 @@ Validation is done against already-fixed bugs from SWE-bench Lite — the only h
 │   ├── llm_orchestration.py# LLM action loop (search / read / write / run)
 │   ├── dataset.py          # SWE-bench dataset loading
 │   ├── metadata.py         # Instance metadata helpers
-│   ├── providers.py        # Provider-agnostic LLM client (Gemini → Groq → HF)
+│   ├── providers.py        # OpenAI-compatible Gemini/Groq client with fallback
 │   └── config.py           # Paths, Docker limits, allowed repos
 ├── scripts/
 │   ├── verify.py           # CLI: verify a hand-written repro
@@ -45,9 +45,9 @@ Validation is done against already-fixed bugs from SWE-bench Lite — the only h
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Docker (with `docker` on PATH)
-- API key for at least one LLM provider: **Google Gemini**, **Groq**, or **Hugging Face**
+- API key for at least one LLM provider: **Google Gemini** or **Groq**
 
 ## Setup
 
@@ -55,15 +55,26 @@ Validation is done against already-fixed bugs from SWE-bench Lite — the only h
 pip install -r requirements.txt
 ```
 
-Copy `.env` and fill in your keys:
+Copy `.env.example` to `.env` and fill in at least one provider key:
 
 ```env
-PROVIDER=gemini          # gemini | groq | huggingface
-MODEL=gemini-2.0-flash
-GEMINI_API_KEY=<your_key>
-GROQ_API_KEY=<your_key>
-HF_API_KEY=<your_key>
+PROVIDER=gemini          # gemini | groq
+MODEL=gemini-2.5-flash
+GEMINI_API_KEY=<your_gemini_key>
+GROQ_API_KEY=<your_groq_key>
+GEMINI_MODEL=gemini-2.5-flash
+GROQ_MODEL=openai/gpt-oss-120b
 ```
+
+The selected `PROVIDER` is tried first. If it returns HTTP 429 and the other
+provider has a key configured, the client tries that provider. `MODEL` applies
+to the selected provider; `GEMINI_MODEL` and `GROQ_MODEL` optionally override
+each provider independently. Keep API keys only in the host `.env`; they are
+not passed to Docker. LLM responses are cached under `cache/`, and daily usage
+is recorded in `cache/llm_usage.json`. Optionally set
+`GEMINI_DAILY_TOKEN_LIMIT` and/or `GROQ_DAILY_TOKEN_LIMIT` to conservative
+limits from your provider consoles; a call is stopped before its estimated
+input plus maximum response could exceed the configured budget.
 
 ## Usage
 
@@ -98,6 +109,8 @@ python -m src.repro_runner <instance_id>
 ```
 
 Runs the LLM action loop and saves the result to `runs/<instance_id>.json`.
+Repeated invocations append an attempt to that JSON log. Each run uses at most
+8 LangGraph turns and 4 network-isolated script executions.
 
 ## Verifier rules
 

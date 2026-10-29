@@ -75,7 +75,7 @@ def run_docker_command(
 
 
 def _image_tag(repository: str, version: str, base_commit: str) -> str:
-    key = "\0".join((repository.lower(), version, base_commit.lower()))
+    key = "\0".join(("mre-day2-ripgrep-v1", repository.lower(), version, base_commit.lower()))
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
     repository_label = repository.lower().replace("/", "-")
     return "mre-{}-{}".format(repository_label, digest)
@@ -112,7 +112,7 @@ def build_environment(instance_id: str) -> str:
 FROM python:{python_version}-slim
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
 RUN apt-get update \\
-    && apt-get install -y --no-install-recommends git \\
+    && apt-get install -y --no-install-recommends git ripgrep \\
     && rm -rf /var/lib/apt/lists/*
 RUN git clone --quiet --no-tags https://github.com/{repository}.git {repository_path} \\
 && git -C {repository_path} checkout --quiet --detach {base_commit} \\
