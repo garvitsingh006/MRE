@@ -112,13 +112,16 @@ def run_script(
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
+                    text=False,
                     timeout=EXECUTION_TIMEOUT_SECONDS,
                     check=False,
                 )
+                # Docker/Linux output is UTF-8; never decode it using the
+                # Windows console's cp1252 locale.
+                output = _decode_timeout_output(completed.stdout)
                 return ScriptResult(
                     exit_code=completed.returncode,
-                    output=_last_lines(completed.stdout or ""),
+                    output=_last_lines(output),
                 )
             except FileNotFoundError as exc:
                 raise RuntimeError(

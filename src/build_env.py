@@ -29,15 +29,27 @@ def run_docker_command(
     check: bool = True,
 ) -> subprocess.CompletedProcess:
     command = [DOCKER_BINARY, *arguments]
+    # The patch must reach Linux git apply byte-for-byte. On Windows, text-mode
+    # subprocess stdin can convert LF to CRLF and corrupt unified-diff context.
+    # Decode Docker output as UTF-8 with replacement instead of using cp1252.
+    input_bytes = input_text.encode("utf-8") if input_text is not None else None
     try:
-        result = subprocess.run(
+        completed = subprocess.run(
             command,
-            input=input_text,
+            input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            text=False,
             timeout=timeout,
             check=False,
+        )
+        output = completed.stdout or b""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        result = subprocess.CompletedProcess(
+            args=completed.args,
+            returncode=completed.returncode,
+            stdout=output,
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
