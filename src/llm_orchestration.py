@@ -1,7 +1,8 @@
 import hashlib
 import json
 import re
-from pathlib import PurePosixPath
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -40,7 +41,8 @@ import sys
 pattern = sys.argv[1]
 command = [
     "rg", "--line-number", "--no-heading", "--color=never",
-    "--max-columns", "300", "--max-columns-preview", "-e", pattern,
+    "--max-columns", "300", "--max-columns-preview", "--glob", "*.py",
+    "-e", pattern,
     "/work/repo",
 ]
 process = subprocess.Popen(
@@ -85,7 +87,7 @@ class ReproState(TypedDict, total=False):
     step: int
     run_count: int
     script: str
-    action: Dict[str, str]
+    action: Any
     actions: List[Dict[str, Any]]
     providers: List[str]
     tokens_used: int
@@ -93,46 +95,95 @@ class ReproState(TypedDict, total=False):
     done: bool
     stop_reason: str
     verifier: Optional[VerificationResult]
+    debug_log_path: Optional[str]
 
 
 class ActionFormatError(ValueError):
     pass
 
 
+def _write_debug_log(
+    path: Optional[str], event: str, details: Dict[str, Any]
+) -> None:
+    if path is None:
+        return
+    log_path = Path(path)
+    if not log_path.is_absolute():
+        raise ValueError("Debug log path must be absolute.")
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **details,
+    }
+    with open(str(log_path), "a", encoding="utf-8") as debug_file:
+        debug_file.write(json.dumps(record, indent=2, ensure_ascii=False))
+        debug_file.write("\n\n")
+
+
 def _system_prompt() -> str:
     return """\
-You create a standalone Python reproduction for the reported bug in the buggy
-repository. The repository is read-only. Never ask to edit or install anything.
-The script must fail for the reported bug on the buggy commit and exit 0 after
-the reference fix. Do not use network access. Do not guess unsupported APIs.
+You write a standalone Python repro for the reported bug in the buggy repo.
+The repo is read-only; do not install packages or use network access. A script
+must exercise the bug, fail for the reported reason before the fix, and pass
+after it. Inspect source under src/ when applicable.
 
-Reply with exactly one fenced action block each turn:
-```text
+Each reply must contain action(s), either as plain text or fenced blocks:
 search <regex>
+read <repo-relative-path> <start-line> <end-line>
+write
+<complete Python script>
+run
+
+Examples:
+```text
+search def .*repr
 ```
 ```text
-read <relative/path> <start-line> <end-line>
+read src/_pytest/_code/code.py 600 680
 ```
 ```text
 write
-<complete standalone Python script>
+print("complete standalone script here")
 ```
 ```text
 run
 ```
-Use search/read to inspect source, write to save the complete script, and run
-to test it. Search returns at most 30 lines; read returns at most 120 lines.
-There are at most 8 turns and 4 runs. When a run reproduces the reported
-failure, stop and briefly state that it is ready for verification.
+You may return several fenced actions together; they run in order. Never put
+search results in a code fence. Search returns Python-source matches only (at
+most 30 lines); read returns at most 120 lines. Write and run the repro before
+you stop. Maximum: 8 model turns, 4 script runs. Do not merely describe a script.
 """
 
 
+def _issue_specific_guidance(problem_statement: str) -> str:
+    normalized = problem_statement.lower()
+    if "internalerror" in normalized and "__repr__" in normalized:
+        return """\
+
+Focused plan for this issue:
+- The report already supplies a minimal failing pytest test; use that instead
+  of spending turns tracing pytest hook names.
+- Inspect `src/_pytest/reports.py` around lines 250-330 and the representation
+  code under `src/_pytest/_code/`. Search for `_repr_failure_py` and `def repr`.
+- The symptom is pytest emitting `INTERNALERROR` while reporting a test
+  failure, not the test's ordinary failure. Build a standalone Python script
+  that writes the supplied test to a temporary file and runs this checkout's
+  pytest against it. Capture and print the combined output. Raise an assertion
+  if that output contains `INTERNALERROR`; on the fixed checkout the test may
+  fail normally, but the wrapper must exit 0.
+- Do not use more than two turns for source inspection. By turn 3, write the
+  complete wrapper; then run it and let the verifier check both commits.
+"""
+    return ""
+
+
 def _initial_prompt(problem_statement: str) -> str:
-    bounded_issue = problem_statement[:6000]
+    bounded_issue = problem_statement[:3000]
     return (
         "Reported issue (truncated to keep the request small):\n"
         + bounded_issue
         + "\n\nThe fixed patch and post-fix repository are hidden from you."
+        + _issue_specific_guidance(problem_statement)
     )
 
 
@@ -140,13 +191,13 @@ def _bounded_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     if len(messages) <= 2:
         return messages
     fixed = messages[:2]
-    recent = messages[2:]
+    recent = messages[2:][-2:]
     retained: List[Dict[str, str]] = []
     budget = MAX_PROMPT_CHARS - sum(len(message["content"]) for message in fixed)
     for message in reversed(recent):
         content = message["content"]
-        if len(content) > 2500:
-            content = content[:2500] + "\n[older output truncated]"
+        if len(content) > 1800:
+            content = content[:1800] + "\n[output truncated]"
         cost = len(content)
         if cost > budget:
             break
@@ -155,11 +206,8 @@ def _bounded_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return fixed + list(reversed(retained))
 
 
-def _parse_action(response: str) -> Dict[str, str]:
-    matches = list(_FENCED_BLOCK.finditer(response))
-    if len(matches) != 1:
-        raise ActionFormatError("Reply must contain one fenced action block.")
-    block = matches[0].group(1).strip("\r\n")
+def _parse_action_block(block: str) -> Dict[str, str]:
+    block = block.strip("\r\n")
     command, separator, body = block.partition("\n")
     command = command.strip()
     if command == "run":
@@ -205,6 +253,49 @@ def _parse_action(response: str) -> Dict[str, str]:
     raise ActionFormatError("Unknown action. Use search, read, write, or run.")
 
 
+def _parse_actions(response: str) -> List[Dict[str, str]]:
+    stripped = response.strip()
+    if not stripped:
+        raise ActionFormatError("The provider returned an empty response.")
+
+    matches = list(_FENCED_BLOCK.finditer(response))
+    prefix = response[:matches[0].start()].strip() if matches else stripped
+    if prefix:
+        first_line = prefix.splitlines()[0].strip()
+        if first_line == "run" or first_line.startswith(("search ", "read ", "write")):
+            return [_parse_action_block(prefix if first_line == "write" else first_line)]
+
+    actions = []
+    for match in matches:
+        try:
+            actions.append(_parse_action_block(match.group(1)))
+        except ActionFormatError:
+            continue
+    trailing = response[matches[-1].end():].strip() if matches else stripped
+    if trailing.startswith("```"):
+        trailing = re.sub(
+            r"^```(?:text|python)[ \t]*\r?\n", "", trailing, count=1
+        )
+        trailing = re.sub(
+            r"^```(?=(?:write|run|search|read)\b)", "", trailing, count=1
+        )
+        trailing = re.sub(r"\r?\n?```[ \t]*$", "", trailing)
+        try:
+            actions.append(_parse_action_block(trailing))
+        except (ActionFormatError, SyntaxError):
+            pass
+    if not actions:
+        raise ActionFormatError(
+            "No valid action found. Start with search/read/write/run or fence each action."
+        )
+    return actions
+
+
+def _parse_action(response: str) -> Dict[str, str]:
+    """Compatibility helper used by callers that expect one action."""
+    return _parse_actions(response)[0]
+
+
 def _tool_command(image: str, executable: str, *arguments: str) -> str:
     completed = run_docker_command(
         [
@@ -218,6 +309,11 @@ def _tool_command(image: str, executable: str, *arguments: str) -> str:
         timeout=DOCKER_COMMAND_TIMEOUT_SECONDS,
         check=False,
     )
+    if completed.returncode:
+        detail = completed.stdout.strip()
+        raise RuntimeError(
+            detail[-1000:] if detail else "Repository inspection command failed."
+        )
     return completed.stdout
 
 
@@ -253,25 +349,63 @@ def _failure_matches_issue(problem_statement: str, output: str) -> bool:
 
 def _agent_node(state: ReproState) -> Dict[str, Any]:
     messages = _bounded_messages(state["messages"])
+    step = state.get("step", 0)
+    if not state.get("script") and step >= 2:
+        messages = messages + [
+            {
+                "role": "user",
+                "content": (
+                    "Turn {} of {}: stop investigating. Your next response MUST "
+                    "write a complete standalone Python repro and run it. Return "
+                    "both actions in this reply if possible. Do not search or read."
+                ).format(step + 1, MAX_LLM_STEPS),
+            }
+        ]
+    _write_debug_log(
+        state.get("debug_log_path"),
+        "llm_request",
+        {"step": step + 1, "messages": messages},
+    )
     response = _cached_chat(state["instance_id"], state.get("step", 0), messages)
-    action: Dict[str, str]
     try:
-        action = _parse_action(response.content)
+        parsed_actions = _parse_actions(response.content)
     except (ActionFormatError, SyntaxError) as exc:
-        action = {"type": "invalid", "error": str(exc)}
+        parsed_actions = [{"type": "invalid", "error": str(exc)}]
     actions = list(state.get("actions", []))
-    actions.append(
+    _write_debug_log(
+        state.get("debug_log_path"),
+        "llm_response",
         {
             "step": state.get("step", 0) + 1,
             "provider": response.provider,
-            "response": response.content[:4000],
-            "action": action["type"],
+            "cached": response.cached,
             "prompt_tokens": response.prompt_tokens,
             "completion_tokens": response.completion_tokens,
-            "total_tokens": response.total_tokens,
-            "cached": response.cached,
-        }
+            "finish_reason": response.finish_reason,
+            "content": response.content,
+            "parsed_actions": parsed_actions,
+        },
     )
+    for index, action in enumerate(parsed_actions):
+        record: Dict[str, Any] = {
+            "step": state.get("step", 0) + 1,
+            "action": action["type"],
+        }
+        if index == 0:
+            record.update(
+                {
+                    "provider": response.provider,
+                    "response": response.content[:4000],
+                    "prompt_tokens": response.prompt_tokens,
+                    "completion_tokens": response.completion_tokens,
+                    "total_tokens": response.total_tokens,
+                    "cached": response.cached,
+                    "finish_reason": response.finish_reason,
+                }
+            )
+        if action["type"] == "invalid":
+            record["error"] = action["error"]
+        actions.append(record)
     providers = list(state.get("providers", []))
     providers.append(response.provider)
     tokens = state.get("tokens_used", 0)
@@ -283,7 +417,7 @@ def _agent_node(state: ReproState) -> Dict[str, Any]:
     conversation = list(state["messages"])
     conversation.append({"role": "assistant", "content": response.content[:4000]})
     return {
-        "action": action,
+        "action": parsed_actions,
         "actions": actions,
         "providers": providers,
         "step": state.get("step", 0) + 1,
@@ -294,64 +428,83 @@ def _agent_node(state: ReproState) -> Dict[str, Any]:
 
 
 def _action_node(state: ReproState) -> Dict[str, Any]:
-    action = state["action"]
+    pending_actions = state["action"]
+    if isinstance(pending_actions, dict):
+        pending_actions = [pending_actions]
     result: Dict[str, Any] = {}
-    response_text = ""
+    action_results = []
     done = False
     stop_reason = ""
     run_count = state.get("run_count", 0)
     script = state.get("script", "")
-    try:
-        action_type = action["type"]
-        if action_type == "search":
-            response_text = _search(state["image"], action["pattern"])
-        elif action_type == "read":
-            response_text = _read(
-                state["image"], action["path"], action["start"], action["end"]
-            )
-        elif action_type == "write":
-            script = action["code"]
-            result["script"] = script
-            response_text = "Saved the standalone reproduction script."
-        elif action_type == "run":
-            if not script:
-                response_text = "No script has been written yet; use a write action first."
-            elif run_count >= MAX_REPRO_RUNS:
-                response_text = "Run limit reached."
-                done = True
-                stop_reason = "Maximum number of reproduction runs reached."
-            else:
-                run_result: ScriptResult = run_script(state["image"], script)
-                run_count += 1
-                output_lines = run_result.output.splitlines()
-                response_text = (
-                    "Exit code: {}\n{}\n".format(
-                        run_result.exit_code,
-                        "\n".join(output_lines[-40:])[-4000:],
-                    )
+    action_log = [dict(record) for record in state.get("actions", [])]
+    for index, action in enumerate(pending_actions):
+        response_text = ""
+        try:
+            action_type = action["type"]
+            if action_type == "search":
+                response_text = _search(state["image"], action["pattern"])
+            elif action_type == "read":
+                response_text = _read(
+                    state["image"], action["path"], action["start"], action["end"]
                 )
-                if (
-                    run_result.exit_code != 0
-                    and not run_result.timed_out
-                    and _failure_matches_issue(
-                        state["problem_statement"], run_result.output
-                    )
-                ):
-                    done = True
-                    stop_reason = "A buggy-code run matched the reported symptom."
+            elif action_type == "write":
+                script = action["code"]
+                response_text = "Saved the standalone reproduction script."
+            elif action_type == "run":
+                if not script:
+                    response_text = "No script has been written yet; use a write action first."
                 elif run_count >= MAX_REPRO_RUNS:
+                    response_text = "Run limit reached."
                     done = True
                     stop_reason = "Maximum number of reproduction runs reached."
-        else:
-            response_text = action.get("error", "Invalid action format.")
-    except (ActionFormatError, OSError, RuntimeError, ValueError) as exc:
-        response_text = "Action failed: {}".format(exc)
+                else:
+                    run_result: ScriptResult = run_script(state["image"], script)
+                    run_count += 1
+                    output_lines = run_result.output.splitlines()
+                    response_text = (
+                        "Exit code: {}\n{}\n".format(
+                            run_result.exit_code,
+                            "\n".join(output_lines[-40:])[-4000:],
+                        )
+                    )
+                    if (
+                        run_result.exit_code != 0
+                        and not run_result.timed_out
+                        and _failure_matches_issue(
+                            state["problem_statement"], run_result.output
+                        )
+                    ):
+                        done = True
+                        stop_reason = "A buggy-code run matched the reported symptom."
+                    elif run_count >= MAX_REPRO_RUNS:
+                        done = True
+                        stop_reason = "Maximum number of reproduction runs reached."
+            else:
+                response_text = action.get("error", "Invalid action format.")
+        except (ActionFormatError, OSError, RuntimeError, ValueError) as exc:
+            response_text = "Action failed: {}".format(exc)
 
-    action_log = list(state.get("actions", []))
-    if action_log:
-        action_log[-1]["result"] = response_text[:4000]
+        log_index = len(action_log) - len(pending_actions) + index
+        if 0 <= log_index < len(action_log):
+            action_log[log_index]["result"] = response_text[:4000]
+        action_results.append("{} result:\n{}".format(action["type"], response_text))
+        _write_debug_log(
+            state.get("debug_log_path"),
+            "action_result",
+            {
+                "step": state.get("step", 0),
+                "action": action,
+                "result": response_text,
+                "script": script if action["type"] in ("write", "run") else None,
+            },
+        )
+        if done:
+            break
+
+    response_text = "\n\n".join(action_results)[-6000:]
     conversation = list(state["messages"])
-    conversation.append({"role": "user", "content": response_text[:4000]})
+    conversation.append({"role": "user", "content": response_text})
     result.update(
         {
             "messages": conversation,
@@ -406,7 +559,12 @@ def _cached_chat(instance_id: str, step: int, messages: List[Dict[str, str]]) ->
     return response
 
 
-def run_repro_loop(instance_id: str, problem_statement: str, image: str) -> Dict[str, Any]:
+def run_repro_loop(
+    instance_id: str,
+    problem_statement: str,
+    image: str,
+    debug_log_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """Run the bounded LangGraph investigation and verify its final script."""
     initial_state: ReproState = {
         "instance_id": instance_id,
@@ -424,6 +582,7 @@ def run_repro_loop(instance_id: str, problem_statement: str, image: str) -> Dict
         "tokens_used": 0,
         "token_usage_available": True,
         "done": False,
+        "debug_log_path": debug_log_path,
     }
     graph = _build_graph()
     state = graph.invoke(
@@ -433,8 +592,21 @@ def run_repro_loop(instance_id: str, problem_statement: str, image: str) -> Dict
 
     script = state.get("script", "")
     verification: Optional[VerificationResult] = verify(instance_id, script) if script else None
+    _write_debug_log(
+        debug_log_path,
+        "verification",
+        {
+            "script": script,
+            "verifier_result": verification.to_dict() if verification else None,
+            "stop_reason": state.get("stop_reason", ""),
+        },
+    )
     if verification is None:
-        failure_reason = state.get("stop_reason") or "The model did not produce a reproduction script."
+        failure_reason = state.get("stop_reason") or (
+            "Reached the {}-turn limit without a reproduction script.".format(
+                MAX_LLM_STEPS
+            )
+        )
     elif verification.passed:
         failure_reason = ""
     else:

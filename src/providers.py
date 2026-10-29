@@ -37,6 +37,7 @@ class ProviderResponse:
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     cached: bool = False
+    finish_reason: Optional[str] = None
 
     @property
     def total_tokens(self) -> Optional[int]:
@@ -92,6 +93,7 @@ def _request(provider: str, model: str, api_key: str, messages: List[Dict[str, s
         provider=provider,
         prompt_tokens=usage.prompt_tokens if usage else None,
         completion_tokens=usage.completion_tokens if usage else None,
+        finish_reason=completion.choices[0].finish_reason,
     )
 
 

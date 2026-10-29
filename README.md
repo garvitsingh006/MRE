@@ -109,7 +109,10 @@ python -m src.repro_runner <instance_id>
 ```
 
 Runs the LLM action loop and saves the result to `runs/<instance_id>.json`.
-Repeated invocations append an attempt to that JSON log. Each run uses at most
+Repeated invocations append an attempt to that JSON log. A timestamped
+`runs/<instance_id>.<timestamp>.debug.log` captures prompts, raw model
+responses, parsed actions, tool output, verifier results, and tracebacks for
+debugging. The CLI output includes that debug-log path. Each run uses at most
 8 LangGraph turns and 4 network-isolated script executions.
 
 ## Verifier rules
@@ -133,12 +136,14 @@ A repro passes only if **all** of the following hold:
 
 ## LLM action format
 
-The model replies with one fenced block per turn:
+The model may reply with plain text actions or multiple fenced action blocks.
+Actions are executed in order, and search results are restricted to Python
+source files:
 
 ```
 search <regex>          → ripgrep in repo, ≤30 matching lines
-read <path> <start> <end> → file contents, ≤120 lines
-write <python code>     → saves the repro script
+read <repo-relative path> <start> <end> → file contents, ≤120 lines
+write                    → next lines contain the complete repro script
 run                     → executes the script, returns last 40 lines
 ```
 
