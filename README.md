@@ -1,4 +1,4 @@
-# MRE Generator — HackCBS 9.0
+# MRE Generator
 
 A Docker-based tool that takes a Python bug report from [SWE-bench Lite](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Lite) and automatically generates a **Minimal Reproduction Example (MRE)** — a short script that fails on the buggy commit and passes on the fixed one.
 
